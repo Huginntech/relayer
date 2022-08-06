@@ -17,36 +17,34 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"math"
-	"os"
-	"os/signal"
+	"net"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 
-	"github.com/avast/retry-go"
-	"github.com/spf13/viper"
-
-	"github.com/cosmos/relayer/relayer"
+	"github.com/cosmos/relayer/v2/internal/relaydebug"
+	"github.com/cosmos/relayer/v2/relayer"
+	"github.com/cosmos/relayer/v2/relayer/processor"
 	"github.com/spf13/cobra"
-	"golang.org/x/sync/errgroup"
+	"go.uber.org/zap"
 )
 
 // startCmd represents the start command
-// NOTE: This is basically pseudocode
-func startCmd() *cobra.Command {
+func startCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "start [path-name]",
+		Use:     "start path_name",
 		Aliases: []string{"st"},
 		Short:   "Start the listening relayer on a given path",
-		Args:    cobra.ExactArgs(1),
+		Args:    withUsage(cobra.ExactArgs(1)),
 		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s start demo-path -p events # to use event processor
 $ %s start demo-path --max-msgs 3
-$ %s start demo-path2 --max-tx-size 10`, appName, appName)),
+$ %s start demo-path2 --max-tx-size 10`, appName, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, src, dst, err := config.ChainsFromPath(args[0])
+			pathName := args[0]
+			c, src, dst, err := a.Config.ChainsFromPath(pathName)
 			if err != nil {
 				return err
 			}
@@ -55,105 +53,77 @@ $ %s start demo-path2 --max-tx-size 10`, appName, appName)),
 				return err
 			}
 
-			path := config.Paths.MustGet(args[0])
+			path := a.Config.Paths.MustGet(pathName)
+
 			maxTxSize, maxMsgLength, err := GetStartOptions(cmd)
 			if err != nil {
 				return err
 			}
 
-			if relayer.SendToController != nil {
-				action := relayer.PathAction{
-					Path: path,
-					Type: "RELAYER_PATH_START",
-				}
-				cont, err := relayer.ControllerUpcall(&action)
-				if !cont {
-					return err
-				}
-			}
+			filter := path.Filter
 
-			done, err := relayer.StartRelayer(c[src], c[dst], maxTxSize, maxMsgLength)
+			var prometheusMetrics *processor.PrometheusMetrics
+
+			debugAddr, err := cmd.Flags().GetString(flagDebugAddr)
 			if err != nil {
-				c[src].Log(fmt.Sprintf("relayer start error. Err: %v", err))
+				return err
 			}
-
-			thresholdTime := viper.GetDuration(flagThresholdTime)
-
-			eg := new(errgroup.Group)
-			eg.Go(func() error {
-				for {
-					var timeToExpiry time.Duration
-					if err := retry.Do(func() error {
-						timeToExpiry, err = UpdateClientsFromChains(c[src], c[dst], thresholdTime)
-						if err != nil {
-							return err
-						}
-						return nil
-					}, retry.Attempts(5), retry.Delay(time.Millisecond*500), retry.LastErrorOnly(true)); err != nil {
-						return err
-					}
-					time.Sleep(timeToExpiry - thresholdTime)
+			if debugAddr == "" {
+				a.Log.Info("Skipping debug server due to empty debug address flag")
+			} else {
+				ln, err := net.Listen("tcp", debugAddr)
+				if err != nil {
+					a.Log.Error("Failed to listen on debug address. If you have another relayer process open, use --" + flagDebugAddr + " to pick a different address.")
+					return fmt.Errorf("failed to listen on debug address %q: %w", debugAddr, err)
 				}
-			})
-			if err = eg.Wait(); err != nil {
-				c[src].Log(fmt.Sprintf("update clients error. Err: %v", err))
+				log := a.Log.With(zap.String("sys", "debughttp"))
+				log.Info("Debug server listening", zap.String("addr", debugAddr))
+				relaydebug.StartDebugServer(cmd.Context(), log, ln)
+				prometheusMetrics = processor.NewPrometheusMetrics()
 			}
 
-			trapSignal(done)
+			processorType, err := cmd.Flags().GetString(flagProcessor)
+			if err != nil {
+				return err
+			}
+			initialBlockHistory, err := cmd.Flags().GetUint64(flagInitialBlockHistory)
+			if err != nil {
+				return err
+			}
+
+			rlyErrCh := relayer.StartRelayer(
+				cmd.Context(),
+				a.Log,
+				c[src], c[dst],
+				filter,
+				maxTxSize, maxMsgLength,
+				a.Config.memo(cmd),
+				processorType, initialBlockHistory,
+				pathName,
+				prometheusMetrics,
+			)
+
+			// Block until the error channel sends a message.
+			// The context being canceled will cause the relayer to stop,
+			// so we don't want to separately monitor the ctx.Done channel,
+			// because we would risk returning before the relayer cleans up.
+			if err := <-rlyErrCh; err != nil && !errors.Is(err, context.Canceled) {
+				a.Log.Warn(
+					"Relayer start error",
+					zap.Error(err),
+				)
+				return err
+			}
 			return nil
 		},
 	}
-	return strategyFlag(updateTimeFlags(cmd))
-}
-
-// trap signal waits for a SIGINT or SIGTERM and then sends down the done channel
-func trapSignal(done func()) {
-	sigCh := make(chan os.Signal, 1)
-
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// wait for a signal
-	sig := <-sigCh
-	fmt.Println("Signal Received", sig.String())
-	close(sigCh)
-
-	// call the cleanup func
-	done()
-}
-
-// UpdateClientsFromChains takes src, dst chains, threshold time and update clients based on expiry time
-func UpdateClientsFromChains(src, dst *relayer.Chain, thresholdTime time.Duration) (time.Duration, error) {
-	var (
-		srcTimeExpiry, dstTimeExpiry time.Duration
-		err                          error
-	)
-
-	eg := new(errgroup.Group)
-	eg.Go(func() error {
-		srcTimeExpiry, err = src.ChainProvider.AutoUpdateClient(dst.ChainProvider, thresholdTime, src.ClientID(), dst.ClientID())
-		return err
-	})
-	eg.Go(func() error {
-		dstTimeExpiry, err = dst.ChainProvider.AutoUpdateClient(src.ChainProvider, thresholdTime, dst.ClientID(), src.ClientID())
-		return err
-	})
-	if err := eg.Wait(); err != nil {
-		return 0, err
-	}
-
-	if srcTimeExpiry <= 0 {
-		return 0, fmt.Errorf("client (%s) of chain: %s is expired",
-			src.PathEnd.ClientID, src.ChainID())
-	}
-
-	if dstTimeExpiry <= 0 {
-		return 0, fmt.Errorf("client (%s) of chain: %s is expired",
-			dst.PathEnd.ClientID, dst.ChainID())
-	}
-
-	minTimeExpiry := math.Min(float64(srcTimeExpiry), float64(dstTimeExpiry))
-
-	return time.Duration(int64(minTimeExpiry)), nil
+	cmd = updateTimeFlags(a.Viper, cmd)
+	cmd = strategyFlag(a.Viper, cmd)
+	cmd = debugServerFlags(a.Viper, cmd)
+	cmd = processorFlag(a.Viper, cmd)
+	cmd = initBlockFlag(a.Viper, cmd)
+	cmd = memoFlag(a.Viper, cmd)
+	return cmd
 }
 
 // GetStartOptions sets strategy specific fields.

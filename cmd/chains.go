@@ -1,19 +1,21 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
-	"github.com/cosmos/relayer/relayer"
-	"github.com/cosmos/relayer/relayer/provider/cosmos"
+	"github.com/cosmos/relayer/v2/relayer"
+	"github.com/cosmos/relayer/v2/relayer/chains/cosmos"
 	"github.com/spf13/cobra"
 	registry "github.com/strangelove-ventures/lens/client/chain_registry"
+	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
 
@@ -22,7 +24,7 @@ const (
 	xIcon = "✘"
 )
 
-func chainsCmd() *cobra.Command {
+func chainsCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "chains",
 		Aliases: []string{"ch"},
@@ -30,38 +32,38 @@ func chainsCmd() *cobra.Command {
 	}
 
 	cmd.AddCommand(
-		chainsListCmd(),
-		chainsRegistryList(),
-		chainsDeleteCmd(),
-		chainsAddCmd(),
-		chainsShowCmd(),
-		chainsAddrCmd(),
-		chainsAddDirCmd(),
+		chainsListCmd(a),
+		chainsRegistryList(a),
+		chainsDeleteCmd(a),
+		chainsAddCmd(a),
+		chainsShowCmd(a),
+		chainsAddrCmd(a),
+		chainsAddDirCmd(a),
 	)
 
 	return cmd
 }
 
-func chainsAddrCmd() *cobra.Command {
+func chainsAddrCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "address [chain-id]",
+		Use:     "address chain_name",
 		Aliases: []string{"addr"},
 		Short:   "Returns a chain's configured key's address",
-		Args:    cobra.ExactArgs(1),
+		Args:    withUsage(cobra.ExactArgs(1)),
 		Example: strings.TrimSpace(fmt.Sprintf(`
 $ %s chains address ibc-0
 $ %s ch addr ibc-0`, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			chain, err := config.Chains.Get(args[0])
-			if err != nil {
-				return err
+			chain, ok := a.Config.Chains[args[0]]
+			if !ok {
+				return errChainNotFound(args[0])
 			}
 
 			address, err := chain.ChainProvider.ShowAddress(chain.ChainProvider.Key())
 			if err != nil {
 				return err
 			}
-			fmt.Println(address)
+			fmt.Fprintln(cmd.OutOrStdout(), address)
 			return nil
 		},
 	}
@@ -69,21 +71,21 @@ $ %s ch addr ibc-0`, appName, appName)),
 	return cmd
 }
 
-func chainsShowCmd() *cobra.Command {
+func chainsShowCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "show [chain-id]",
+		Use:     "show chain_name",
 		Aliases: []string{"s"},
 		Short:   "Returns a chain's configuration data",
-		Args:    cobra.ExactArgs(1),
+		Args:    withUsage(cobra.ExactArgs(1)),
 		Example: strings.TrimSpace(fmt.Sprintf(`
 $ %s chains show ibc-0 --json
 $ %s chains show ibc-0 --yaml
 $ %s ch s ibc-0 --json
 $ %s ch s ibc-0 --yaml`, appName, appName, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := config.Chains.Get(args[0])
-			if err != nil {
-				return err
+			c, ok := a.Config.Chains[args[0]]
+			if !ok {
+				return errChainNotFound(args[0])
 			}
 			jsn, err := cmd.Flags().GetBool(flagJSON)
 			if err != nil {
@@ -99,7 +101,7 @@ $ %s ch s ibc-0 --yaml`, appName, appName, appName, appName)),
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(out))
+				fmt.Fprintln(cmd.OutOrStdout(), string(out))
 				return nil
 			default:
 				pcfgw := &ProviderConfigWrapper{
@@ -110,34 +112,39 @@ $ %s ch s ibc-0 --yaml`, appName, appName, appName, appName)),
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(out))
+				fmt.Fprintln(cmd.OutOrStdout(), string(out))
 				return nil
 			}
 		},
 	}
-	return jsonFlag(cmd)
+	return jsonFlag(a.Viper, cmd)
 }
 
-func chainsDeleteCmd() *cobra.Command {
+func chainsDeleteCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "delete [chain-id]",
+		Use:     "delete chain_name",
 		Aliases: []string{"d"},
-		Short:   "Returns chain configuration data",
-		Args:    cobra.ExactArgs(1),
+		Short:   "Removes chain from config based off chain-id",
+		Args:    withUsage(cobra.ExactArgs(1)),
 		Example: strings.TrimSpace(fmt.Sprintf(`
 $ %s chains delete ibc-0
 $ %s ch d ibc-0`, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return overWriteConfig(config.DeleteChain(args[0]))
+			_, ok := a.Config.Chains[args[0]]
+			if !ok {
+				return errChainNotFound(args[0])
+			}
+			a.Config.DeleteChain(args[0])
+			return a.OverwriteConfig(a.Config)
 		},
 	}
 	return cmd
 }
 
-func chainsRegistryList() *cobra.Command {
+func chainsRegistryList(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "registry-list",
-		Args:    cobra.NoArgs,
+		Args:    withUsage(cobra.NoArgs),
 		Aliases: []string{"rl"},
 		Short:   "List chains available for configuration from the registry",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -151,7 +158,7 @@ func chainsRegistryList() *cobra.Command {
 				return err
 			}
 
-			chains, err := registry.DefaultChainRegistry().ListChains()
+			chains, err := registry.DefaultChainRegistry(a.Log).ListChains(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -164,31 +171,32 @@ func chainsRegistryList() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(out))
+				fmt.Fprintln(cmd.OutOrStdout(), string(out))
 				return nil
 			case jsn:
 				out, err := json.Marshal(chains)
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(out))
+				fmt.Fprintln(cmd.OutOrStdout(), string(out))
 				return nil
 			default:
 				for _, chain := range chains {
-					fmt.Println(chain)
+					fmt.Fprintln(cmd.OutOrStdout(), chain)
 				}
 			}
 			return nil
 		},
 	}
-	return yamlFlag(jsonFlag(cmd))
+	return yamlFlag(a.Viper, jsonFlag(a.Viper, cmd))
 }
 
-func chainsListCmd() *cobra.Command {
+func chainsListCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"l"},
 		Short:   "Returns chain configuration data",
+		Args:    withUsage(cobra.NoArgs),
 		Example: strings.TrimSpace(fmt.Sprintf(`
 $ %s chains list
 $ %s ch l`, appName, appName)),
@@ -203,25 +211,31 @@ $ %s ch l`, appName, appName)),
 				return err
 			}
 
+			configs := a.Config.Wrapped().ProviderConfigs
+			if len(configs) == 0 {
+				fmt.Fprintln(cmd.ErrOrStderr(), "warning: no chains found (do you need to run 'rly chains add'?)")
+			}
+
 			switch {
 			case yml && jsn:
 				return fmt.Errorf("can't pass both --json and --yaml, must pick one")
 			case yml:
-				out, err := yaml.Marshal(ConfigToWrapper(config).ProviderConfigs)
+				out, err := yaml.Marshal(configs)
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(out))
+				fmt.Fprintln(cmd.OutOrStdout(), string(out))
 				return nil
 			case jsn:
-				out, err := json.Marshal(ConfigToWrapper(config).ProviderConfigs)
+				out, err := json.Marshal(configs)
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(out))
+				fmt.Fprintln(cmd.OutOrStdout(), string(out))
 				return nil
 			default:
-				for i, c := range config.Chains {
+				i := 0
+				for _, c := range a.Config.Chains {
 					var (
 						key = xIcon
 						p   = xIcon
@@ -232,134 +246,156 @@ $ %s ch l`, appName, appName)),
 						key = check
 					}
 
-					coins, err := c.ChainProvider.QueryBalance(c.ChainProvider.Key())
+					coins, err := c.ChainProvider.QueryBalance(cmd.Context(), c.ChainProvider.Key())
 					if err == nil && !coins.Empty() {
 						bal = check
 					}
 
-					for _, pth := range config.Paths {
+					for _, pth := range a.Config.Paths {
 						if pth.Src.ChainID == c.ChainProvider.ChainId() || pth.Dst.ChainID == c.ChainID() {
 							p = check
 						}
 					}
-					fmt.Printf("%2d: %-20s -> type(%s) key(%s) bal(%s) path(%s)\n", i, c.ChainID(), c.ChainProvider.Type(), key, bal, p)
+					i++
+					fmt.Fprintf(cmd.OutOrStdout(), "%2d: %-20s -> type(%s) key(%s) bal(%s) path(%s)\n", i, c.ChainID(), c.ChainProvider.Type(), key, bal, p)
 				}
 				return nil
 			}
 		},
 	}
-	return yamlFlag(jsonFlag(cmd))
+	return yamlFlag(a.Viper, jsonFlag(a.Viper, cmd))
 }
 
-func chainsAddCmd() *cobra.Command {
+func chainsAddCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "add [[chain-name]]",
+		Use:     "add [chain-name...]",
 		Aliases: []string{"a"},
 		Short: "Add a new chain to the configuration file by fetching chain metadata from \n" +
 			"                the chain-registry or passing a file (-f) or url (-u)",
-		Args: cobra.MinimumNArgs(0),
+		Args: withUsage(cobra.MinimumNArgs(0)),
 		Example: fmt.Sprintf(` $ %s chains add cosmoshub
  $ %s chains add cosmoshub osmosis
- $ %s chains add --file chains/ibc0.json
- $ %s chains add --url https://relayer.com/ibc0.json`, appName, appName, appName, appName),
+ $ %s chains add --file chains/ibc0.json ibc0
+ $ %s chains add --url https://relayer.com/ibc0.json ibc0`, appName, appName, appName, appName),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var out *Config
-
 			file, url, err := getAddInputs(cmd)
 			if err != nil {
 				return err
+			}
+
+			if ok := a.Config; ok == nil {
+				return fmt.Errorf("config not initialized, consider running `rly config init`")
 			}
 
 			// default behavior fetch from chain registry
 			// still allow for adding config from url or file
 			switch {
 			case file != "":
-				if out, err = fileInputAdd(file); err != nil {
+				var chainName string
+				switch len(args) {
+				case 0:
+					chainName = strings.Split(filepath.Base(file), ".")[0]
+				case 1:
+					chainName = args[0]
+				default:
+					return errors.New("one chain name is required")
+				}
+				if err := addChainFromFile(a, chainName, file); err != nil {
 					return err
 				}
 			case url != "":
-				if out, err = urlInputAdd(url); err != nil {
+				if len(args) != 1 {
+					return errors.New("one chain name is required")
+				}
+				if err := addChainFromURL(a, args[0], url); err != nil {
 					return err
 				}
 			default:
-				if out, err = chainRegistryAdd(args); err != nil {
+				if err := addChainsFromRegistry(cmd.Context(), a, args); err != nil {
 					return err
 				}
 			}
 
-			if err = validateConfig(out); err != nil {
+			if err := validateConfig(a.Config); err != nil {
 				return err
 			}
 
-			return overWriteConfig(out)
+			return a.OverwriteConfig(a.Config)
 		},
 	}
 
-	return chainsAddFlags(cmd)
+	return chainsAddFlags(a.Viper, cmd)
 }
 
-func chainsAddDirCmd() *cobra.Command {
+func chainsAddDirCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "add-dir [dir]",
+		Use:     "add-dir dir",
 		Aliases: []string{"ad"},
-		Args:    cobra.ExactArgs(1),
-		Short: `Add new chains to the configuration file from a directory 
-		full of chain configuration, useful for adding testnet configurations`,
+		Args:    withUsage(cobra.ExactArgs(1)),
+		Short:   `Add chain configuration data in bulk from a directory. Example dir: 'configs/demo/chains'`,
+		Long: `Add chain configuration data in bulk from a directory housing individual chain config files. This is useful for spinning up testnets.
+		
+		See 'configs/demo/chains' for an example of individual chain config files.`,
 		Example: strings.TrimSpace(fmt.Sprintf(`
-$ %s chains add-dir testnet/chains/
+$ %s chains add-dir configs/demo/chains
 $ %s ch ad testnet/chains/`, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
-			var out *Config
-			if out, err = cfgFilesAddChains(args[0]); err != nil {
+			if err := addChainsFromDirectory(cmd.ErrOrStderr(), a, args[0]); err != nil {
 				return err
 			}
-			return overWriteConfig(out)
+			return a.OverwriteConfig(a.Config)
 		},
 	}
 
 	return cmd
 }
 
-func fileInputAdd(file string) (cfg *Config, err error) {
+// addChainFromFile reads a JSON-formatted chain from the named file
+// and adds it to a's chains.
+func addChainFromFile(a *appState, chainName string, file string) error {
 	// If the user passes in a file, attempt to read the chain config from that file
 	var pcw ProviderConfigWrapper
 	if _, err := os.Stat(file); err != nil {
-		return nil, err
+		return err
 	}
 
 	byt, err := os.ReadFile(file)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if err = json.Unmarshal(byt, &pcw); err != nil {
-		return nil, err
+		return err
 	}
 
-	prov, err := pcw.Value.NewProvider(homePath, debug)
+	prov, err := pcw.Value.NewProvider(
+		a.Log.With(zap.String("provider_type", pcw.Type)),
+		a.HomePath, a.Debug, chainName,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build ChainProvider for %s: %w", file, err)
+		return fmt.Errorf("failed to build ChainProvider for %s: %w", file, err)
 	}
 
-	c := &relayer.Chain{ChainProvider: prov}
-
-	if err = config.AddChain(c); err != nil {
-		return nil, err
+	c := relayer.NewChain(a.Log, prov, a.Debug)
+	if err = a.Config.AddChain(c); err != nil {
+		return err
 	}
 
-	return config, nil
+	return nil
 }
 
-// urlInputAdd validates a chain config URL and fetches its contents
-func urlInputAdd(rawurl string) (cfg *Config, err error) {
+// addChainFromURL fetches a JSON-encoded chain from the given URL
+// and adds it to a's chains.
+func addChainFromURL(a *appState, chainName string, rawurl string) error {
 	u, err := url.Parse(rawurl)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return cfg, errors.New("invalid URL")
+		return fmt.Errorf("invalid URL %s", rawurl)
 	}
 
+	// TODO: add a rly user agent to this outgoing request.
 	resp, err := http.Get(u.String())
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 
@@ -368,31 +404,41 @@ func urlInputAdd(rawurl string) (cfg *Config, err error) {
 	d.DisallowUnknownFields()
 	err = d.Decode(&pcw)
 	if err != nil {
-		return cfg, err
+		return err
 	}
 
 	// build the ChainProvider before initializing the chain
-	prov, err := pcw.Value.NewProvider(homePath, debug)
+	prov, err := pcw.Value.NewProvider(
+		a.Log.With(zap.String("provider_type", pcw.Type)),
+		a.HomePath, a.Debug, chainName,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build ChainProvider for %s: %w", rawurl, err)
+		return fmt.Errorf("failed to build ChainProvider for %s: %w", rawurl, err)
 	}
 
-	c := &relayer.Chain{ChainProvider: prov}
-
-	if err = config.AddChain(c); err != nil {
-		return nil, err
+	c := relayer.NewChain(a.Log, prov, a.Debug)
+	if err := a.Config.AddChain(c); err != nil {
+		return err
 	}
-	return config, err
+	return nil
 }
 
-func chainRegistryAdd(chains []string) (*Config, error) {
-	chainRegistry := registry.DefaultChainRegistry()
-	allChains, err := chainRegistry.ListChains()
+func addChainsFromRegistry(ctx context.Context, a *appState, chains []string) error {
+	chainRegistry := registry.DefaultChainRegistry(a.Log)
+	allChains, err := chainRegistry.ListChains(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-
+	foundError := false
 	for _, chain := range chains {
+		if _, ok := a.Config.Chains[chain]; ok {
+			a.Log.Warn(
+				"Chain already exists",
+				zap.String("chain", chain),
+				zap.String("source_link", chainRegistry.SourceLink()),
+			)
+			continue
+		}
 		found := false
 		for _, possibleChain := range allChains {
 			if chain == possibleChain {
@@ -400,25 +446,40 @@ func chainRegistryAdd(chains []string) (*Config, error) {
 			}
 
 			if !found {
-				log.Printf("unable to find chain %s in %s", chain, chainRegistry.SourceLink())
+				a.Log.Warn(
+					"Unable to find chain",
+					zap.String("chain", chain),
+					zap.String("source_link", chainRegistry.SourceLink()),
+				)
 				continue
 			}
 
-			chainInfo, err := chainRegistry.GetChain(chain)
+			chainInfo, err := chainRegistry.GetChain(ctx, chain)
 			if err != nil {
-				log.Printf("error getting chain: %s", err)
+				a.Log.Warn(
+					"Error retrieving chain",
+					zap.String("chain", chain),
+					zap.Error(err),
+				)
+				foundError = true
 				continue
 			}
 
-			chainConfig, err := chainInfo.GetChainConfig()
+			chainConfig, err := chainInfo.GetChainConfig(ctx)
 			if err != nil {
-				log.Printf("error generating chain config: %s", err)
+				a.Log.Warn(
+					"Error generating chain config",
+					zap.String("chain", chain),
+					zap.Error(err),
+				)
+				foundError = true
 				continue
 			}
 
 			// build the ChainProvider
 			pcfg := &cosmos.CosmosProviderConfig{
 				Key:            chainConfig.Key,
+				ChainName:      chainInfo.ChainName,
 				ChainID:        chainConfig.ChainID,
 				RPCAddr:        chainConfig.RPCAddr,
 				AccountPrefix:  chainConfig.AccountPrefix,
@@ -431,25 +492,38 @@ func chainRegistryAdd(chains []string) (*Config, error) {
 				SignModeStr:    chainConfig.SignModeStr,
 			}
 
-			prov, err := pcfg.NewProvider(homePath, debug)
+			prov, err := pcfg.NewProvider(
+				a.Log.With(zap.String("provider_type", "cosmos")),
+				a.HomePath, a.Debug, chainInfo.ChainName,
+			)
 			if err != nil {
-				log.Printf("failed to build ChainProvider for %s. Err: %v", chainConfig.ChainID, err)
+				a.Log.Warn(
+					"Failed to build ChainProvider",
+					zap.String("chain_id", chainConfig.ChainID),
+					zap.Error(err),
+				)
+				foundError = true
 				continue
 			}
 
-			// build the chain
-			c := &relayer.Chain{ChainProvider: prov}
-
 			// add to config
-			if err = config.AddChain(c); err != nil {
-				log.Printf("failed to add chaiin %s to config. Err: %v", chain, err)
-				return nil, err
+			c := relayer.NewChain(a.Log, prov, a.Debug)
+			if err = a.Config.AddChain(c); err != nil {
+				a.Log.Warn(
+					"Failed to add chain to config",
+					zap.String("chain", chain),
+					zap.Error(err),
+				)
+				foundError = true
+				continue
 			}
 
 			// found the correct chain so move on to next chain in chains
 			break
 		}
 	}
-
-	return config, err
+	if foundError {
+		return errors.New("some chain(s) failed to be added to config")
+	}
+	return nil
 }
